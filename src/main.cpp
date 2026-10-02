@@ -1,117 +1,109 @@
 #include <ESP32Servo.h>
 
-// ================== 構成 ==================
-const int FINS_PER_SIDE = 6;
-enum Side { LEFT = 0, RIGHT = 1 };
-const int NUM_SIDES = 2;
+// ================== 構成（左側専用） ==================
+const int FINS_COUNT = 6;
+const int finPins[FINS_COUNT] = { 4, 5, 25, 26, 27, 14 }; // 左側ピン
 
-// ピン配置（左 / 右）
-const int finPins[NUM_SIDES][FINS_PER_SIDE] = {
-  { 4,  5, 25, 26, 27, 14 },   // 左
-  { 22, 21, 19, 18, 33, 32 }   // 右
-};
+Servo fins[FINS_COUNT];
 
-Servo fins[NUM_SIDES][FINS_PER_SIDE];
-
-// サーボの可動範囲（270°サーボ設定）
 const float SERVO_MAX_DEG = 270.0;
 const int   PULSE_MIN_US  = 500;
 const int   PULSE_MAX_US  = 2400;
 
+// ================== 角度の定義 ==================
+// ヒレ角度: 0 = 水平, +90 = 真下, マイナス = 水平より上
+const float SERVO_CENTER_DEG  = 135.0; // サーボ可動域の中央
+const float FIN_AT_CENTER_DEG = 45.0;  // サーボ中央のときのヒレ角度
+                                       // → 上90°〜下180° を使える
+const float FIN_DOWN_DEG      = 90.0;  // 真下
+
+// ヒレの機構的な可動限界（胴体などに当たる場合はここを狭める）
+const float FIN_ANGLE_MIN = -90.0;     // 水平より上 90°
+const float FIN_ANGLE_MAX = 180.0;     // 真下をさらに 90° 越えた位置
+
 // ================== 遊泳パラメータ ==================
-float frequency  = 1.0;    // 振動数 [Hz]
-float amplitude  = 30.0;   // 振幅 [deg]
-float phaseStep  = 60.0;   // 隣のヒレとの位相差 [deg]
-float baseAngle  = 135.0;  // 基準角度
-float diveOffset = 0.0;    // 潜行オフセット
+float frequency   = 1.0;    // 振動数 [Hz]
+float amplitude   = 30.0;   // 振幅 [deg]
+float phaseStep   = 60.0;   // 隣のヒレとの位相差 [deg]
+float swimAngle   = 90.0;   // 遊泳中心のヒレ角度 (0:水平 〜 90:真下)
+float diveOffset  = 0.0;    // 潜行オフセット
+float finDir      = 1.0;    // 回転方向
 
-// 左右の回転方向
-float sideDir[NUM_SIDES] = { 1.0, 1.0 };
+float sideAmpScale = 1.0;   // 旋回用倍率
+float sideAmpTrim  = 1.3;   // 左側基本振幅補正（1.3倍）
+float sideWaveDir  = 1.0;   // 波の進行方向 (+1:前進, -1:後退)
 
-// 左右ごとの振幅倍率（旋回用）: 0.0〜1.0
-float sideAmpScale[NUM_SIDES] = { 1.0, 1.0 };
-
-// 左右ごとの基本振幅補正（左の動きを大きくするために1.3倍に設定）
-float sideAmpTrim[NUM_SIDES] = { 1.3, 1.0 };
-
-// 左右ごとの波の進行方向: +1 = 前進, -1 = 後退
-float sideWaveDir[NUM_SIDES] = { 1.0, 1.0 };
-
-// 左右の位相ずれ [deg]
-float sidePhaseShift[NUM_SIDES] = { 0.0, 0.0 };
-
-// ヒレごとの取り付け誤差補正 [deg]（水平フラット化用）
-float finOffset[NUM_SIDES][FINS_PER_SIDE] = {
-  { 90, 90, 90, 90, 90, 85 },   // 左
-  { 90, 90, 90, 90, 90, 90 }    // 右
-};
+// ホーン取付けの歯ずれ補正 [deg]（数度程度の微調整用）
+float finTrim[FINS_COUNT] = { 0, 0, 0, 0, 0, 5 };
 
 enum SwimMode { SWIM_NORMAL, SWIM_STOPPED };
 SwimMode mode = SWIM_STOPPED;
 
-// 経過時間の管理用
-float wavePhase = 0.0;  // [rad]
+float wavePhase = 0.0;
 unsigned long lastPhaseMs = 0;
 
 // ================== 低レベル出力 ==================
-void writeFin(int side, int i, float angle) {
+void writeFin(int i, float angle) {
   angle = constrain(angle, 0.0, SERVO_MAX_DEG);
   int us = PULSE_MIN_US + (int)(angle / SERVO_MAX_DEG * (PULSE_MAX_US - PULSE_MIN_US));
-  fins[side][i].writeMicroseconds(us);
+  fins[i].writeMicroseconds(us);
 }
 
-float toServoAngle(int side, int i, float delta) {
-  return baseAngle + finOffset[side][i] + sideDir[side] * delta;
+// ヒレ角度(0=水平, 90=真下) → サーボ角
+float toServoAngle(int i, float finAngle) {
+  finAngle = constrain(finAngle, FIN_ANGLE_MIN, FIN_ANGLE_MAX);
+  return SERVO_CENTER_DEG + finDir * (finAngle - FIN_AT_CENTER_DEG) + finTrim[i];
 }
 
-// ================== 操作用関数 ==================
-void setDiveOffset(float deg) {
-  diveOffset = constrain(deg, -30.0, 30.0);
+void holdAll(float finAngle) {
+  for (int i = 0; i < FINS_COUNT; i++) writeFin(i, toServoAngle(i, finAngle));
 }
 
-void setTurn(float turn) {
-  turn = constrain(turn, -1.0, 1.0);
-  sideWaveDir[LEFT]  = 1.0;
-  sideWaveDir[RIGHT] = 1.0;
-  if (turn >= 0) {
-    sideAmpScale[LEFT]  = 1.0;
-    sideAmpScale[RIGHT] = 1.0 - turn;
-  } else {
-    sideAmpScale[LEFT]  = 1.0 + turn;
-    sideAmpScale[RIGHT] = 1.0;
-  }
-}
-
-void setSpin(int dir) {
-  sideAmpScale[LEFT]  = 1.0;
-  sideAmpScale[RIGHT] = 1.0;
-  sideWaveDir[LEFT]   = (dir > 0) ?  1.0 : -1.0;
-  sideWaveDir[RIGHT]  = (dir > 0) ? -1.0 :  1.0;
-}
-
-void startSwim() {
-  lastPhaseMs = millis();
-  mode = SWIM_NORMAL;
-}
-
-void stopSwim() {
-  mode = SWIM_STOPPED;
-  for (int s = 0; s < NUM_SIDES; s++) {
-    for (int i = 0; i < FINS_PER_SIDE; i++) {
-      writeFin(s, i, toServoAngle(s, i, diveOffset));
-    }
+// ================== 操作・コマンド処理 ==================
+void applyCommand(char c) {
+  switch (c) {
+    case 'w': // 前進
+      sideWaveDir = 1.0; sideAmpScale = 1.0;
+      lastPhaseMs = millis(); mode = SWIM_NORMAL;
+      break;
+    case 'x': // 停止
+      mode = SWIM_STOPPED;
+      holdAll(swimAngle + diveOffset);
+      break;
+    case 'a': // 左旋回 (左の振幅を減衰)
+      sideWaveDir = 1.0; sideAmpScale = 0.4;
+      break;
+    case 'd': // 右旋回 (左は全開)
+      sideWaveDir = 1.0; sideAmpScale = 1.0;
+      break;
+    case 'c': // 直進に戻す
+      sideWaveDir = 1.0; sideAmpScale = 1.0;
+      break;
+    case 'q': // その場左回り
+      sideAmpScale = 1.0; sideWaveDir = -1.0;
+      break;
+    case 'e': // その場右回り
+      sideAmpScale = 1.0; sideWaveDir = 1.0;
+      break;
+    case 'u': diveOffset = constrain(diveOffset - 5, -30.0, 30.0); break;
+    case 'j': diveOffset = constrain(diveOffset + 5, -30.0, 30.0); break;
+    case 'r': swimAngle = constrain(swimAngle - 10, 0.0, 90.0); break; // 水平寄りへ
+    case 'f': swimAngle = constrain(swimAngle + 10, 0.0, 90.0); break; // 真下寄りへ
+    case 'h': // 取付け用: 水平で停止
+      mode = SWIM_STOPPED;
+      holdAll(0);
+      break;
+    case 'v': // 確認用: 真下で停止
+      mode = SWIM_STOPPED;
+      holdAll(FIN_DOWN_DEG);
+      break;
   }
 }
 
 // ================== 波の計算 ==================
-float calcFinDelta(int side, int i) {
-  float phase = wavePhase
-              + sideWaveDir[side] * radians(phaseStep * i)
-              + radians(sidePhaseShift[side]);
-  
-  // sideAmpTrim を掛け合わせて左右個別の振幅調整を実施
-  float amp = amplitude * sideAmpScale[side] * sideAmpTrim[side];
-  
+float calcFinDelta(int i) {
+  float phase = wavePhase + sideWaveDir * radians(phaseStep * i);
+  float amp   = amplitude * sideAmpScale * sideAmpTrim;
   return diveOffset + amp * sin(phase);
 }
 
@@ -123,67 +115,40 @@ void updateSwim() {
   wavePhase += 2.0 * PI * frequency * dt;
   if (wavePhase > 2.0 * PI) wavePhase -= 2.0 * PI;
 
-  for (int s = 0; s < NUM_SIDES; s++) {
-    for (int i = 0; i < FINS_PER_SIDE; i++) {
-      writeFin(s, i, toServoAngle(s, i, calcFinDelta(s, i)));
-    }
+  for (int i = 0; i < FINS_COUNT; i++) {
+    writeFin(i, toServoAngle(i, swimAngle + calcFinDelta(i)));
   }
 }
 
-// ================== シリアルで動作確認 ==================
-void handleSerial() {
-  if (!Serial.available()) return;
-  char c = Serial.read();
-  switch (c) {
-    case 'w': setTurn(0); startSwim();              break;
-    case 'x': stopSwim();                            break;
-    case 'a': setTurn(-0.6);                         break;
-    case 'd': setTurn( 0.6);                         break;
-    case 'c': setTurn(0);                            break;
-    case 'q': setSpin(-1);                           break;
-    case 'e': setSpin( 1);                           break;
-    case 'u': setDiveOffset(diveOffset - 5);         break;
-    case 'j': setDiveOffset(diveOffset + 5);         break;
-    default: return;
-  }
-  Serial.printf("cmd=%c  ampL=%.2f ampR=%.2f waveL=%+.0f waveR=%+.0f dive=%.1f\n",
-                c, sideAmpScale[LEFT], sideAmpScale[RIGHT],
-                sideWaveDir[LEFT], sideWaveDir[RIGHT], diveOffset);
-}
-
-// ================== setup / loop ==================
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200);                       // PC用シリアル
+  Serial1.begin(115200, SERIAL_8N1, 16, 17);  // 右側ESP32通信用 (RX:16, TX:17)
 
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
 
-  for (int s = 0; s < NUM_SIDES; s++) {
-    for (int i = 0; i < FINS_PER_SIDE; i++) {
-      fins[s][i].setPeriodHertz(50);
-      fins[s][i].attach(finPins[s][i], PULSE_MIN_US, PULSE_MAX_US);
-      writeFin(s, i, toServoAngle(s, i, 0));
-      delay(50);
-    }
+  for (int i = 0; i < FINS_COUNT; i++) {
+    fins[i].setPeriodHertz(50);
+    fins[i].attach(finPins[i], PULSE_MIN_US, PULSE_MAX_US);
+    writeFin(i, toServoAngle(i, swimAngle));
+    delay(50);
   }
-
   delay(1000);
-  startSwim();
+  applyCommand('w'); // 初期動作：前進
 }
 
-unsigned long lastUpdate = 0;
-const unsigned long updateInterval = 15; // ms
-
 void loop() {
-  handleSerial();
+  // PCからのコマンド受信 ＆ 右側ESP32へUART転送
+  if (Serial.available()) {
+    char c = Serial.read();
+    Serial1.write(c); // 右側ESP32へそのまま送信
+    applyCommand(c);  // 自身の制御に反映
+  }
 
+  static unsigned long lastUpdate = 0;
   unsigned long now = millis();
-  if (now - lastUpdate >= updateInterval) {
+  if (now - lastUpdate >= 15) {
     lastUpdate = now;
-    if (mode == SWIM_NORMAL) {
-      updateSwim();
-    }
+    if (mode == SWIM_NORMAL) updateSwim();
   }
 }
