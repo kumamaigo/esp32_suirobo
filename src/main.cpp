@@ -1,12 +1,4 @@
 #include <ESP32Servo.h>
-#include <WiFi.h>
-#include <WebServer.h>
-
-// ================== Wi-Fi設定 (Access Point) ==================
-const char* ssid     = "FishRobot-AP"; // スマホから接続するWi-Fi名
-const char* password = "password123";  // Wi-Fiパスワード (8文字以上)
-
-WebServer server(80);
 
 // ================== 構成（左側専用） ==================
 const int FINS_COUNT = 6;
@@ -19,31 +11,34 @@ const int   PULSE_MIN_US  = 500;
 const int   PULSE_MAX_US  = 2400;
 
 // ================== 角度の定義 ==================
-const float SERVO_CENTER_DEG  = 135.0;
-const float FIN_AT_CENTER_DEG = 45.0;
-const float FIN_DOWN_DEG      = 90.0;
+const float SERVO_CENTER_DEG  = 135.0; // サーボ可動域の中央
+const float FIN_AT_CENTER_DEG = 45.0;  // サーボ中央のときのヒレ角度
+const float FIN_DOWN_DEG      = 90.0;  // 真下
 
-const float FIN_ANGLE_MIN = -90.0;
-const float FIN_ANGLE_MAX = 180.0;
+const float FIN_ANGLE_MIN = -90.0;     // 水平より上 90°
+const float FIN_ANGLE_MAX = 180.0;     // 真下をさらに 90° 越えた位置
 
 // ================== 遊泳パラメータ ==================
-float frequency   = 1.0;
-float amplitude   = 30.0;
-float phaseStep   = 60.0;
-float swimAngle   = 90.0;
-float diveOffset  = 0.0;
-float finDir      = 1.0;
+float frequency   = 1.0;    // 振動数 [Hz]
+float amplitude   = 30.0;   // 振幅 [deg]
+float phaseStep   = 60.0;   // 隣のヒレとの位相差 [deg]
 
-float sideAmpScale = 1.0;
-float sideAmpTrim  = 1.3;
-float sideWaveDir  = 1.0;
+// --- 角度遷移用の変数 ---
+float swimAngle       = 0.0;    // 現在のヒレ中心角度 (0:水平 〜 90:真下)
+float targetSwimAngle = 0.0;    // 目標のヒレ中心角度
+float transitionTime  = 6.0;    // 変化にかける時間 [秒]
+
+float diveOffset  = 0.0;    // 潜行オフセット
+float finDir      = 1.0;    // 回転方向
+
+float sideAmpScale = 1.0;   // 旋回用倍率
+float sideAmpTrim  = 1.3;   // 左側基本振幅補正（1.3倍）
+float sideWaveDir  = 1.0;   // 波の進行方向 (+1:前進, -1:後退)
 
 float finTrim[FINS_COUNT] = { 0, 0, 0, 0, 0, 5 };
 
 enum SwimMode { SWIM_NORMAL, SWIM_STOPPED };
 SwimMode mode = SWIM_STOPPED;
-
-String currentStatus = "停止中";
 
 float wavePhase = 0.0;
 unsigned long lastPhaseMs = 0;
@@ -70,47 +65,58 @@ void applyCommand(char c) {
     case 'w': // 前進
       sideWaveDir = 1.0; sideAmpScale = 1.0;
       lastPhaseMs = millis(); mode = SWIM_NORMAL;
-      currentStatus = "前進";
-      break;
-    case 's': // 後進
-      sideWaveDir = -1.0; sideAmpScale = 1.0;
-      lastPhaseMs = millis(); mode = SWIM_NORMAL;
-      currentStatus = "後進";
+      Serial.println("-> Command: Forward (w)");
       break;
     case 'x': // 停止
       mode = SWIM_STOPPED;
       holdAll(swimAngle + diveOffset);
-      currentStatus = "停止中";
+      Serial.println("-> Command: Stop (x)");
       break;
-    case 'a': // 左前旋回
+    case 'a': // 左旋回
       sideWaveDir = 1.0; sideAmpScale = 0.4;
-      lastPhaseMs = millis(); mode = SWIM_NORMAL;
-      currentStatus = "左前旋回";
+      Serial.println("-> Command: Turn Left (a)");
       break;
-    case 'd': // 右前旋回
+    case 'd': // 右旋回
       sideWaveDir = 1.0; sideAmpScale = 1.0;
-      lastPhaseMs = millis(); mode = SWIM_NORMAL;
-      currentStatus = "右前旋回";
+      Serial.println("-> Command: Turn Right (d)");
       break;
-    case 'z': // 左後旋回
-      sideWaveDir = -1.0; sideAmpScale = 0.4;
-      lastPhaseMs = millis(); mode = SWIM_NORMAL;
-      currentStatus = "左後旋回";
+    case 'c': // 直進に戻す
+      sideWaveDir = 1.0; sideAmpScale = 1.0;
+      Serial.println("-> Command: Straight (c)");
       break;
-    case 'c': // 右後旋回
-      sideWaveDir = -1.0; sideAmpScale = 1.0;
-      lastPhaseMs = millis(); mode = SWIM_NORMAL;
-      currentStatus = "右後旋回";
-      break;
-    case 'q': // その場左旋回
+    case 'q': // その場左回り
       sideAmpScale = 1.0; sideWaveDir = -1.0;
-      lastPhaseMs = millis(); mode = SWIM_NORMAL;
-      currentStatus = "その場左旋回";
+      Serial.println("-> Command: Rotate Left (q)");
       break;
-    case 'e': // その場右旋回
+    case 'e': // その場右回り
       sideAmpScale = 1.0; sideWaveDir = 1.0;
-      lastPhaseMs = millis(); mode = SWIM_NORMAL;
-      currentStatus = "その場右旋回";
+      Serial.println("-> Command: Rotate Right (e)");
+      break;
+    case 'm': // 陸上モード（6秒かけて真下 90° へ）
+      targetSwimAngle = 90.0;
+      Serial.println("-> Command: Land Mode (90 deg / 6 sec) (m)");
+      break;
+    case 'n': // 水中モード（6秒かけて水平 0° へ復帰）
+      targetSwimAngle = 0.0;
+      Serial.println("-> Command: Water Mode (0 deg / 6 sec) (n)");
+      break;
+    case 'u': 
+      diveOffset = constrain(diveOffset - 5, -30.0, 30.0);
+      Serial.print("-> Dive Offset: "); Serial.println(diveOffset);
+      break;
+    case 'j': 
+      diveOffset = constrain(diveOffset + 5, -30.0, 30.0);
+      Serial.print("-> Dive Offset: "); Serial.println(diveOffset);
+      break;
+    case 'h': // 取付け用: 水平で停止
+      mode = SWIM_STOPPED;
+      holdAll(0);
+      Serial.println("-> Command: Hold Horizontal (h)");
+      break;
+    case 'v': // 確認用: 真下で停止
+      mode = SWIM_STOPPED;
+      holdAll(FIN_DOWN_DEG);
+      Serial.println("-> Command: Hold Down (v)");
       break;
   }
 }
@@ -127,144 +133,31 @@ void updateSwim() {
   float dt = (now - lastPhaseMs) / 1000.0;
   lastPhaseMs = now;
 
+  // 1. 角度の滑らかな遷移処理（6秒間かけて targetSwimAngle へ近づける）
+  if (swimAngle != targetSwimAngle) {
+    float changeSpeed = 90.0 / transitionTime; // 1秒あたりの変化度数
+    if (swimAngle < targetSwimAngle) {
+      swimAngle += changeSpeed * dt;
+      if (swimAngle > targetSwimAngle) swimAngle = targetSwimAngle;
+    } else {
+      swimAngle -= changeSpeed * dt;
+      if (swimAngle < targetSwimAngle) swimAngle = targetSwimAngle;
+    }
+  }
+
+  // 2. 波動の位相更新
   wavePhase += 2.0 * PI * frequency * dt;
   if (wavePhase > 2.0 * PI) wavePhase -= 2.0 * PI;
 
+  // 3. 各ヒレへの出力
   for (int i = 0; i < FINS_COUNT; i++) {
     writeFin(i, toServoAngle(i, swimAngle + calcFinDelta(i)));
   }
 }
 
-// ================== HTML 画面 (Web UI) ==================
-const char HTML_PAGE[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Fish Robot Controller</title>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-      margin: 0;
-      background-color: #f0f0f0;
-      user-select: none;
-    }
-    .grid-container {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 12px;
-      width: 90vw;
-      max-width: 600px;
-      padding: 10px;
-    }
-    .btn {
-      background-color: #dbeafe;
-      border: 2px solid #1e3a8a;
-      border-radius: 8px;
-      padding: 20px 10px;
-      font-size: 18px;
-      font-weight: bold;
-      color: #000;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      cursor: pointer;
-      text-align: center;
-      box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
-    }
-    .btn:active {
-      background-color: #bfdbfe;
-      transform: scale(0.98);
-    }
-    .btn-stop {
-      background-color: #fee2e2;
-      border: 2px solid #991b1b;
-      color: #991b1b;
-    }
-    .btn-stop:active {
-      background-color: #fca5a5;
-    }
-    .status-card {
-      background-color: #ffedd5;
-      border: 2px solid #c2410c;
-      border-radius: 8px;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      font-size: 18px;
-      font-weight: bold;
-      color: #000;
-      padding: 15px 5px;
-      text-align: center;
-    }
-    .arrow { margin-left: 6px; font-size: 20px; }
-  </style>
-</head>
-<body>
-  <div class="grid-container">
-    <div class="btn" onclick="sendCmd('a')">左前旋回 <span class="arrow">↖</span></div>
-    <div class="btn" onclick="sendCmd('w')">前進 <span class="arrow">↑</span></div>
-    <div class="btn" onclick="sendCmd('d')">右前旋回 <span class="arrow">↗</span></div>
-
-    <div class="btn" onclick="sendCmd('q')">その場左旋回 ↺</div>
-    <div class="status-card" id="status">STATUS: 停止中</div>
-    <div class="btn" onclick="sendCmd('e')">↻ その場右旋回</div>
-
-    <div class="btn" onclick="sendCmd('z')">左後旋回 <span class="arrow">↙</span></div>
-    <div class="btn" onclick="sendCmd('s')">後進 <span class="arrow">↓</span></div>
-    <div class="btn" onclick="sendCmd('c')">右後旋回 <span class="arrow">↘</span></div>
-
-    <!-- 後進の下（中央列の4段目）に配置 -->
-    <div class="btn btn-stop" style="grid-column: 2;" onclick="sendCmd('x')">停止 ⏹</div>
-  </div>
-
-  <script>
-    function sendCmd(cmd) {
-      fetch('/cmd?val=' + cmd)
-        .then(response => response.text())
-        .then(txt => {
-          document.getElementById('status').innerText = 'STATUS: ' + txt;
-        });
-    }
-  </script>
-</body>
-</html>
-)rawliteral";
-
-// ================== HTTPハンドラ ==================
-void handleRoot() {
-  server.send(200, "text/html", HTML_PAGE);
-}
-
-void handleCmd() {
-  if (server.hasArg("val")) {
-    char c = server.arg("val").charAt(0);
-    Serial1.write(c); // 右側ESP32へ転送
-    applyCommand(c);  // 自身の制御に反映
-    server.send(200, "text/plain", currentStatus);
-  } else {
-    server.send(400, "text/plain", "Bad Request");
-  }
-}
-
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(115200, SERIAL_8N1, 16, 17); // 右側ESP32通信用 (RX:16, TX:17)
-
-  // SoftAP（親機）モードの起動
-  WiFi.softAP(ssid, password);
-  Serial.print("AP IP Address: ");
-  Serial.println(WiFi.softAPIP());
-
-  // Webサーバー設定
-  server.on("/", handleRoot);
-  server.on("/cmd", handleCmd);
-  server.begin();
+  Serial1.begin(115200, SERIAL_8N1, 16, 17);
 
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
@@ -276,15 +169,15 @@ void setup() {
     delay(50);
   }
   delay(1000);
+  
+  Serial.println("=== ESP32 Fin Control System Ready ===");
+  applyCommand('w'); // 初期動作：前進
 }
 
 void loop() {
-  server.handleClient(); // Webリクエスト処理
-
-  // PCシリアルからのデバッグ入力対応
   if (Serial.available()) {
     char c = Serial.read();
-    Serial1.write(c);
+    Serial1.write(c); // 右側ESP32へ転送
     applyCommand(c);
   }
 
