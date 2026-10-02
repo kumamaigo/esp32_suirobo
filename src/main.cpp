@@ -2,7 +2,7 @@
 
 // ================== 構成（左側専用） ==================
 const int FINS_COUNT = 6;
-const int finPins[FINS_COUNT] = { 4, 5, 25, 26, 27, 14 }; // 左側ピン
+const int finPins[FINS_COUNT] = { 33, 32, 18, 19, 21, 14 }; // 左側ピン
 
 Servo fins[FINS_COUNT];
 
